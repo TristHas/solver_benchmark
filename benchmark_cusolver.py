@@ -229,8 +229,8 @@ def build_cases(n: int, b: int) -> list[Case]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ns", type=str, default="64,128,256,512")
-    parser.add_argument("--bs", type=str, default="16,64,128")
+    parser.add_argument("--ns", type=str, default="16,32,64,128,256,512,1024")
+    parser.add_argument("--bs", type=str, default="16,64,128,256,1024,4096")
     parser.add_argument("--out", type=str, default="cusolver_vectors_knobs_results.csv")
     args = parser.parse_args()
 

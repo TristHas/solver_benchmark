@@ -208,7 +208,7 @@ def run_sweep(ns: list[int], bs: list[int], dtype: torch.dtype) -> list[dict[str
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ns", type=str, default="16,32,64,128,256,512,1024")
-    parser.add_argument("--bs", type=str, default="16,64,128")
+    parser.add_argument("--bs", type=str, default="16,64,128,256,1024,4096")
     parser.add_argument("--out", type=str, default="benchmark_eigh_results.csv")
     args = parser.parse_args()
 
