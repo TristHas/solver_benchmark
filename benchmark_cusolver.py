@@ -1,6 +1,8 @@
+import argparse
 import csv
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -11,39 +13,47 @@ from cusolver_torch import eigh
 class Case:
     tag: str
     driver: str
-    compute_vectors: bool
-    copy_input: bool
-    tol: float = 1e-7
-    max_sweeps: int = 100
+    lower: bool = True
+    deterministic_mode: int = 0
+    tol: float = 1e-5
+    max_sweeps: int = 20
     sort_eig: bool = True
     k: int | None = None
-    which: str = "largest"  # for syevdx
+    which: str = "largest"
+    chunk_size: int | None = None
+
+
+def _is_oom(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cuda_error_out_of_memory" in msg
+        or "cuda out of memory" in msg
+        or "cusolver_status_alloc_failed" in msg
+    )
+
+
+def _clear_cuda_mem() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def make_symmetric(batch: int, n: int, dtype: torch.dtype) -> torch.Tensor:
     a = torch.randn(batch, n, n, device="cuda", dtype=dtype)
     return (a + a.transpose(-1, -2)) * 0.5
 
+
 def pick_iters(n: int) -> int:
-    if n <= 64:
-        return 20
     if n <= 128:
-        return 10
+        return 8
     if n <= 256:
         return 5
     return 3
 
-def pick_batch(n: int) -> int:
-    if n <= 64:
-        return 256
-    if n <= 128:
-        return 128
-    if n <= 256:
-        return 64
-    return 16
 
-def run_case(a_ref: torch.Tensor, case: Case, iters: int) -> dict:
+def run_case(a_ref: torch.Tensor, case: Case, iters: int) -> dict[str, Any]:
     n = a_ref.shape[-1]
+    b = a_ref.shape[0]
     a_work = a_ref.clone()
 
     il, iu = 1, -1
@@ -55,208 +65,212 @@ def run_case(a_ref: torch.Tensor, case: Case, iters: int) -> dict:
         else:
             il, iu = 1, k
 
-    def call_solver(return_meig: bool = False):
-        # cuSOLVER overwrites A for these routines. Keep input identical per iteration.
-        if case.copy_input:
-            target = a_ref
-        else:
-            a_work.copy_(a_ref)
-            target = a_work
+    chunk = case.chunk_size if case.chunk_size is not None else b
+    chunk = max(1, min(chunk, b))
 
-        return eigh(
-            target,
-            compute_vectors=case.compute_vectors,
-            driver=case.driver,
-            tol=case.tol,
-            max_sweeps=case.max_sweeps,
-            sort_eig=case.sort_eig,
-            il=il,
-            iu=iu,
-            copy_input=case.copy_input,
-            return_meig=return_meig,
-        )
+    def call_once(return_meig: bool = False):
+        infos = []
+        meigs = []
+        out_w = []
+        out_v = []
 
-    # Warmup
-    call_solver(return_meig=False)
+        for start in range(0, b, chunk):
+            end = min(b, start + chunk)
+            target = a_work[start:end]
+            target.copy_(a_ref[start:end])
+
+            w, v, info, meig = eigh(
+                target,
+                compute_vectors=True,
+                lower=case.lower,
+                driver=case.driver,
+                tol=case.tol,
+                max_sweeps=case.max_sweeps,
+                sort_eig=case.sort_eig,
+                il=il,
+                iu=iu,
+                copy_input=False,
+                deterministic_mode=case.deterministic_mode,
+                return_meig=True,
+            )
+
+            if return_meig:
+                infos.append(info.detach().cpu().reshape(-1))
+                meigs.append(meig.detach().cpu().reshape(-1))
+                out_w.append(w)
+                out_v.append(v)
+
+        if return_meig:
+            return (
+                torch.cat(out_w, dim=0),
+                torch.cat(out_v, dim=0),
+                torch.cat(infos, dim=0),
+                torch.cat(meigs, dim=0),
+            )
+        return None
+
+    call_once(return_meig=False)
     torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+    start_ev.record()
     for _ in range(iters):
-        call_solver(return_meig=False)
-    end.record()
+        call_once(return_meig=False)
+    end_ev.record()
     torch.cuda.synchronize()
-    ms = start.elapsed_time(end) / iters
+    ms = start_ev.elapsed_time(end_ev) / iters
 
-    # Collect status from one run for convergence diagnostics.
-    w, v, info, meig = call_solver(return_meig=True)
+    _, _, info, meig = call_once(return_meig=True)
     torch.cuda.synchronize()
 
-    info_host = info.detach().cpu().reshape(-1)
-    nonzero_info = int((info_host != 0).sum().item())
-    max_info = int(info_host.max().item()) if info_host.numel() else 0
-
-    meig_host = meig.detach().cpu().reshape(-1)
-    meig_min = int(meig_host.min().item()) if meig_host.numel() else n
-    meig_max = int(meig_host.max().item()) if meig_host.numel() else n
-
-    solved_k = n
-    if case.driver == "syevdx":
-        solved_k = meig_max
+    nonzero_info = int((info != 0).sum().item())
+    max_info = int(info.max().item()) if info.numel() else 0
+    meig_min = int(meig.min().item()) if meig.numel() else n
+    meig_max = int(meig.max().item()) if meig.numel() else n
 
     return {
         "N": n,
-        "B": int(a_ref.shape[0]),
+        "B": b,
         "dtype": str(a_ref.dtype).replace("torch.", ""),
         "iters": iters,
         "tag": case.tag,
         "driver": case.driver,
-        "compute_vectors": case.compute_vectors,
-        "copy_input": case.copy_input,
+        "lower": case.lower,
+        "deterministic_mode": case.deterministic_mode,
         "tol": case.tol,
         "max_sweeps": case.max_sweeps,
         "sort_eig": case.sort_eig,
-        "which": case.which,
         "k_request": case.k if case.k is not None else n,
+        "which": case.which,
         "il": il,
         "iu": iu,
-        "k_solved_min": meig_min,
-        "k_solved_max": meig_max,
+        "chunk_size": chunk,
         "time_ms": float(ms),
-        "time_per_matrix_ms": float(ms / a_ref.shape[0]),
-        "throughput_mat_per_s": float((a_ref.shape[0] * 1000.0) / ms),
+        "time_per_matrix_ms": float(ms / b),
+        "throughput_mat_per_s": float((b * 1000.0) / ms),
         "nonzero_info": nonzero_info,
         "max_info": max_info,
+        "k_solved_min": meig_min,
+        "k_solved_max": meig_max,
+        "status": "ok",
+        "error": "",
     }
 
 
-def build_cases(n: int) -> list[Case]:
+def nan_row(n: int, b: int, iters: int, case: Case, status: str, err: str) -> dict[str, Any]:
+    return {
+        "N": n,
+        "B": b,
+        "dtype": "float32",
+        "iters": iters,
+        "tag": case.tag,
+        "driver": case.driver,
+        "lower": case.lower,
+        "deterministic_mode": case.deterministic_mode,
+        "tol": case.tol,
+        "max_sweeps": case.max_sweeps,
+        "sort_eig": case.sort_eig,
+        "k_request": case.k if case.k is not None else n,
+        "which": case.which,
+        "il": 1,
+        "iu": -1,
+        "chunk_size": case.chunk_size if case.chunk_size is not None else b,
+        "time_ms": float("nan"),
+        "time_per_matrix_ms": float("nan"),
+        "throughput_mat_per_s": float("nan"),
+        "nonzero_info": -1,
+        "max_info": -1,
+        "k_solved_min": -1,
+        "k_solved_max": -1,
+        "status": status,
+        "error": err,
+    }
+
+
+def build_cases(n: int, b: int) -> list[Case]:
     ks = [k for k in [8, 16, 32, 64, 128] if k <= n]
+    chunks = sorted(set([b, max(1, b // 2), max(1, b // 4)]))
 
-    cases: list[Case] = []
+    out: list[Case] = []
 
-    # Exact solvers.
-    for compute_vectors in [False, True]:
-        for copy_input in [False, True]:
-            cases.append(
-                Case(
-                    tag=f"exact_syevd_vec{int(compute_vectors)}_copy{int(copy_input)}",
-                    driver="syevd",
-                    compute_vectors=compute_vectors,
-                    copy_input=copy_input,
-                )
-            )
+    for lower in [True, False]:
+        for det in [0, 1, 2]:
+            out.append(Case(tag=f"syevd_vec_uplo{int(lower)}_det{det}", driver="syevd", lower=lower, deterministic_mode=det))
 
-    for driver in ["syevj", "syevj_batched"]:
-        for tol in [1e-5, 1e-7]:
+    for lower in [True, False]:
+        for tol in [1e-5, 1e-6, 1e-7]:
             for sweeps in [20, 50, 100]:
-                for sort_eig in [False, True]:
-                    cases.append(
-                        Case(
-                            tag=f"exact_{driver}_vec0_tol{tol:g}_sw{sweeps}_sort{int(sort_eig)}_copy0",
-                            driver=driver,
-                            compute_vectors=False,
-                            copy_input=False,
-                            tol=tol,
-                            max_sweeps=sweeps,
-                            sort_eig=sort_eig,
-                        )
+                out.append(
+                    Case(
+                        tag=f"syevj_batched_vec_uplo{int(lower)}_tol{tol:g}_sw{sweeps}",
+                        driver="syevj_batched",
+                        lower=lower,
+                        tol=tol,
+                        max_sweeps=sweeps,
+                        sort_eig=True,
                     )
+                )
 
-        # Include one vector-producing setting for each jacobi backend.
-        cases.append(
-            Case(
-                tag=f"exact_{driver}_vec1_tol1e-7_sw100_sort1_copy0",
-                driver=driver,
-                compute_vectors=True,
-                copy_input=False,
-                tol=1e-7,
-                max_sweeps=100,
-                sort_eig=True,
-            )
-        )
+    for lower in [True, False]:
+        for det in [0, 1, 2]:
+            out.append(Case(tag=f"xsyev_batched_vec_uplo{int(lower)}_det{det}", driver="xsyev_batched", lower=lower, deterministic_mode=det))
 
-    # Truncated exact solves via syevdx.
+    for chunk in chunks:
+        out.append(Case(tag=f"syevd_chunk{chunk}", driver="syevd", chunk_size=chunk))
+        out.append(Case(tag=f"xsyev_batched_chunk{chunk}", driver="xsyev_batched", chunk_size=chunk))
+
     for k in ks:
         for which in ["largest", "smallest"]:
-            for compute_vectors in [False, True]:
-                cases.append(
-                    Case(
-                        tag=f"trunc_syevdx_k{k}_{which}_vec{int(compute_vectors)}_copy0",
-                        driver="syevdx",
-                        compute_vectors=compute_vectors,
-                        copy_input=False,
-                        k=k,
-                        which=which,
-                    )
-                )
+            out.append(Case(tag=f"syevdx_vec_k{k}_{which}", driver="syevdx", k=k, which=which))
 
-    return cases
+    return out
 
 
-def print_top(results: list[dict], n: int, title: str, predicate) -> None:
-    subset = [r for r in results if r["N"] == n and predicate(r)]
-    subset.sort(key=lambda x: x["time_ms"])
-    print(f"\\n{title} (N={n})")
-    print("rank  time_ms   per_mat_ms  mats/s   nonzero_info  tag")
-    for i, r in enumerate(subset[:8], start=1):
-        print(
-            f"{i:>4d}  {r['time_ms']:8.3f}  {r['time_per_matrix_ms']:10.4f}  {r['throughput_mat_per_s']:7.1f}"
-            f"  {r['nonzero_info']:12d}  {r['tag']}"
-        )
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ns", type=str, default="64,128,256,512")
+    parser.add_argument("--bs", type=str, default="16,64,128")
+    parser.add_argument("--out", type=str, default="cusolver_vectors_knobs_results.csv")
+    args = parser.parse_args()
 
-
-def main():
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
-
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
 
-    dtype = torch.float32
-    ns = [64, 128, 256, 512]
-    results: list[dict] = []
+    ns = [int(x) for x in args.ns.split(",") if x.strip()]
+    bs = [int(x) for x in args.bs.split(",") if x.strip()]
 
-    for n in ns:
-        b = pick_batch(n)
-        iters = pick_iters(n)
-        a = make_symmetric(b, n, dtype)
-        cases = build_cases(n)
+    rows: list[dict[str, Any]] = []
 
-        print(f"\\nRunning N={n}, B={b}, iters={iters}, cases={len(cases)}")
+    for b in bs:
+        for n in ns:
+            iters = pick_iters(n)
+            a = make_symmetric(b, n, torch.float32)
+            cases = build_cases(n, b)
+            print(f"\nRunning vectors benchmark N={n}, B={b}, iters={iters}, cases={len(cases)}")
 
-        for idx, case in enumerate(cases, start=1):
-            r = run_case(a, case, iters)
-            results.append(r)
-            print(
-                f"[{idx:>3d}/{len(cases)}] {case.tag:<58s}"
-                f" {r['time_ms']:9.3f} ms  info_nonzero={r['nonzero_info']}"
-            )
+            for i, c in enumerate(cases, start=1):
+                try:
+                    r = run_case(a, c, iters)
+                except Exception as exc:
+                    if _is_oom(exc):
+                        _clear_cuda_mem()
+                        r = nan_row(n, b, iters, c, "oom", str(exc).replace("\n", " ")[:500])
+                    else:
+                        r = nan_row(n, b, iters, c, "error", str(exc).replace("\n", " ")[:500])
+                rows.append(r)
+                t = r["time_ms"]
+                t_str = f"{t:9.3f}" if math.isfinite(t) else "      nan"
+                print(f"[{i:>3d}/{len(cases)}] {c.tag:<45s} {t_str} ms status={r['status']}")
 
-    out_csv = "cusolver_benchmark_results.csv"
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
+    with open(args.out, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(rows)
 
-    print(f"\\nWrote {out_csv} with {len(results)} rows")
-
-    for n in ns:
-        print_top(results, n, "Top exact configs", lambda r: not r["tag"].startswith("trunc_"))
-        print_top(results, n, "Top truncated configs", lambda r: r["tag"].startswith("trunc_"))
-
-    # Global best summary.
-    exact = [r for r in results if not r["tag"].startswith("trunc_")]
-    trunc = [r for r in results if r["tag"].startswith("trunc_")]
-    best_exact = min(exact, key=lambda x: x["time_per_matrix_ms"])
-    best_trunc = min(trunc, key=lambda x: x["time_per_matrix_ms"])
-
-    print("\\nGlobal best exact:")
-    print(best_exact)
-    print("\\nGlobal best truncated:")
-    print(best_trunc)
+    print(f"\nWrote {args.out} ({len(rows)} rows)")
 
 
 if __name__ == "__main__":
