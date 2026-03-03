@@ -247,9 +247,21 @@ def main() -> None:
     for b in bs:
         for n in ns:
             iters = pick_iters(n)
-            a = make_symmetric(b, n, torch.float32)
             cases = build_cases(n, b)
             print(f"\nRunning vectors benchmark N={n}, B={b}, iters={iters}, cases={len(cases)}")
+
+            try:
+                a = make_symmetric(b, n, torch.float32)
+            except Exception as exc:
+                status = "oom" if _is_oom(exc) else "error"
+                if status == "oom":
+                    _clear_cuda_mem()
+                err = str(exc).replace("\n", " ")[:500]
+                for i, c in enumerate(cases, start=1):
+                    r = nan_row(n, b, iters, c, status, err)
+                    rows.append(r)
+                    print(f"[{i:>3d}/{len(cases)}] {c.tag:<45s}       nan ms status={r['status']}")
+                continue
 
             for i, c in enumerate(cases, start=1):
                 try:
@@ -264,6 +276,9 @@ def main() -> None:
                 t = r["time_ms"]
                 t_str = f"{t:9.3f}" if math.isfinite(t) else "      nan"
                 print(f"[{i:>3d}/{len(cases)}] {c.tag:<45s} {t_str} ms status={r['status']}")
+
+    if not rows:
+        raise RuntimeError("No results generated")
 
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
